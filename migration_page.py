@@ -80,7 +80,7 @@ def _get_sql_conn(cfg: dict, autocommit=False):
     """
 
     conn_str = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        "DRIVER={ODBC Driver 17 for SQL Server};"
         f"SERVER={cfg['server']};"
         f"DATABASE={cfg['database']};"
         f"UID={cfg['uid']};"
