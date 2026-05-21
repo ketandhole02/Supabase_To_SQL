@@ -7,11 +7,8 @@ Import and call render() from your main app:
     from migration_page import render
     render()
 
-No DSN required — connection string is built purely from
-what the client enters in the UI. Works on Streamlit Cloud.
-
-Dependencies:
-    pip install streamlit psycopg2-binary pyodbc python-dotenv
+- Supabase credentials are hardcoded in backend (not shown in UI)
+- SQL Server connects via DSN config entered by client in UI
 """
 
 import streamlit as st
@@ -27,6 +24,20 @@ TABLE_PATTERN  = "migr_sql_to_ws_%"
 SOURCE_PREFIX  = "migr_sql_to_"
 EXCLUDE_COLS   = {"system_id"}
 
+# ─────────────────────────────────────────────
+# Supabase credentials — BACKEND ONLY
+# Never shown in the UI
+# ─────────────────────────────────────────────
+_PG_CONFIG = {
+    "host":            "aws-0-ap-south-1.pooler.supabase.com",
+    "port":            6543,
+    "dbname":          "postgres",
+    "user":            "postgres.smvcwjoefalywezaftrw",
+    "password":        "SupaBaseDE@2026",
+    "sslmode":         "require",
+    "connect_timeout": 10,
+}
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -39,58 +50,34 @@ def source_to_target(name: str) -> str:
     return name
 
 
-def build_pg_connstr(cfg: dict) -> dict:
-    """Returns kwargs dict for psycopg2.connect()"""
-    return {
-        "host":     cfg["host"],
-        "port":     int(cfg["port"]),
-        "dbname":   cfg["dbname"],
-        "user":     cfg["user"],
-        "password": cfg["password"],
-        "sslmode":  "require",
-        "connect_timeout": 10,
-    }
-
-
-# def build_sql_connstr(cfg: dict) -> str:
-#     """
-#     Builds a pyodbc connection string purely from UI inputs.
-#     No DSN needed — works on any machine including Streamlit Cloud.
-
-#     Supports:
-#       - SQL Server Authentication  (UID + PWD)
-#       - Windows Authentication     (Trusted_Connection=yes)
-#     """
-#     driver  = cfg.get("driver", "ODBC Driver 17 for SQL Server")
-#     server  = cfg["server"].strip()
-#     database = cfg["database"].strip()
-
-#     base = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
-
-#     if cfg["auth"] == "Windows Authentication":
-#         return base + "Trusted_Connection=yes;"
-#     else:
-#         uid = cfg["uid"].strip()
-#         pwd = cfg["pwd"]
-#         return base + f"UID={uid};PWD={pwd};"
-
-
-
-
-def get_sql_connection():
-    log.info("Connecting to local SQL Server...")
-    cfg = DSN_CONFIG
+def build_sql_connstr(cfg: dict) -> str:
+    """
+    Builds pyodbc connection string from DSN config entered by client.
+    Supports Windows Authentication and SQL Server Authentication.
+    """
     conn_str = (
-        
-        f"DSN={cfg['DSN']};"
-        f"UID={cfg['Uid']};"
-        f"PWD={cfg['Password']};"
-        f"Trusted_Connection={cfg['Trusted_Connection']};"
-        f"DATABASE={cfg['Database']};"
+        f"DSN={cfg['dsn']};"
+        f"UID={cfg['uid']};"
+        f"PWD={cfg['pwd']};"
+        f"Trusted_Connection={cfg['trusted']};"
+        f"DATABASE={cfg['database']};"
     )
-    
-    conn = pyodbc.connect(conn_str, autocommit=False)
-    log.info("✓ SQL Server connection established.")
+    return conn_str
+
+
+# ─────────────────────────────────────────────
+# Connection helpers
+# ─────────────────────────────────────────────
+
+def _get_pg_conn():
+    """Internal — uses hardcoded backend credentials."""
+    return psycopg2.connect(**_PG_CONFIG)
+
+
+def _get_sql_conn(cfg: dict, autocommit=False):
+    """Internal — uses DSN config from UI."""
+    conn = pyodbc.connect(build_sql_connstr(cfg), timeout=10)
+    conn.autocommit = autocommit
     return conn
 
 
@@ -98,10 +85,13 @@ def get_sql_connection():
 # Connection verification
 # ─────────────────────────────────────────────
 
-def verify_pg(cfg: dict) -> tuple:
-    """Returns (True, table_count) or (False, error_message)"""
+def verify_pg() -> tuple:
+    """
+    Verifies Supabase connection using backend credentials.
+    Returns (True, table_count) or (False, error_message)
+    """
     try:
-        conn = psycopg2.connect(**build_pg_connstr(cfg))
+        conn = _get_pg_conn()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM information_schema.tables "
@@ -116,9 +106,12 @@ def verify_pg(cfg: dict) -> tuple:
 
 
 def verify_sql(cfg: dict) -> tuple:
-    """Returns (True, None) or (False, error_message)"""
+    """
+    Verifies SQL Server connection using DSN config from UI.
+    Returns (True, None) or (False, error_message)
+    """
     try:
-        conn = pyodbc.connect(get_sql_connection(cfg), timeout=10)
+        conn = _get_sql_conn(cfg, autocommit=True)
         conn.close()
         return True, None
     except Exception as e:
@@ -127,25 +120,32 @@ def verify_sql(cfg: dict) -> tuple:
 
 def _friendly_pg_error(err: str) -> str:
     if "password authentication failed" in err:
-        return "❌ Wrong Supabase password. Please check your credentials."
+        return "❌ Supabase authentication failed. Contact your administrator."
     if "could not connect" in err or "Connection refused" in err:
-        return "❌ Cannot reach Supabase host. Check the host and port."
+        return "❌ Cannot reach Supabase. Please try again later."
     if "SSL" in err:
-        return "❌ SSL error. Make sure SSL mode is set to 'require' for Supabase."
-    return f"❌ {err}"
+        return "❌ Supabase SSL error. Please try again later."
+    return f"❌ Supabase error: {err}"
 
 
 def _friendly_sql_error(err: str, cfg: dict) -> str:
     if "Data source name not found" in err or "IM002" in err:
-        return "❌ ODBC Driver not found on this machine. Try selecting a different driver."
+        return (
+            f"❌ DSN '{cfg.get('dsn', '')}' not found on this machine.\n\n"
+            "Open **Windows ODBC Data Source Administrator (64-bit)** "
+            "→ System DSN → Add → configure your SQL Server → "
+            f"name it exactly **{cfg.get('dsn', '')}**."
+        )
     if "Login failed" in err:
-        return f"❌ Login failed for user '{cfg.get('uid', '')}'. Check username and password."
+        return f"❌ Login failed for user '{cfg.get('uid', '')}'. Check your username and password."
     if "Cannot open database" in err:
         return f"❌ Database '{cfg.get('database', '')}' not found. Check the database name."
     if "server was not found" in err or "Could not open" in err:
-        return f"❌ Server '{cfg.get('server', '')}' not reachable. Check server name and network."
+        return "❌ SQL Server not reachable. Check your DSN server configuration."
     if "TCP Provider" in err or "10061" in err:
-        return "❌ Connection refused. Make sure SQL Server is running and port 1433 is open."
+        return "❌ Connection refused. Make sure SQL Server is running and accessible."
+    if "Login timeout" in err or "HYT00" in err:
+        return "❌ Connection timed out. Make sure SQL Server is running on this machine."
     return f"❌ {err}"
 
 
@@ -208,7 +208,7 @@ def pg_to_sql_type(pg_type: str, max_len) -> str:
     }.get(pg_type.lower(), "NVARCHAR(MAX)")
 
 
-def ensure_table_exists(sql_conn, pg_conn, src_table: str, tgt_table: str, columns: list, emit):
+def ensure_table_exists(sql_conn, pg_conn, src_table, tgt_table, columns, emit):
     cur = sql_conn.cursor()
     cur.execute(
         "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
@@ -235,16 +235,18 @@ def ensure_table_exists(sql_conn, pg_conn, src_table: str, tgt_table: str, colum
     emit(f"OK    [dbo].[{tgt_table}] created successfully.", "ok")
 
 
-def run_migration(pg_cfg: dict, sql_cfg: dict, tables: list, emit) -> dict:
+def run_migration(sql_cfg: dict, tables: list, emit) -> dict:
     """
-    Runs full migration: for each table →
-      1. Get Supabase columns
-      2. Intersect with SQL Server columns
-      3. TRUNCATE target
-      4. IDENTITY_INSERT ON → bulk INSERT → IDENTITY_INSERT OFF
+    Full migration flow per table:
+      A. Get Supabase columns
+      B. Ensure target table exists
+      C. Intersect columns (Supabase ∩ SQL Server)
+      D. Fetch rows from Supabase
+      E. TRUNCATE target table
+      F. IDENTITY_INSERT ON → bulk INSERT → IDENTITY_INSERT OFF
     """
-    pg_conn  = psycopg2.connect(**build_pg_connstr(pg_cfg))
-    sql_conn = pyodbc.connect(build_sql_connstr(sql_cfg), autocommit=False)
+    pg_conn  = _get_pg_conn()
+    sql_conn = _get_sql_conn(sql_cfg, autocommit=False)
     success = failed = 0
     total   = len(tables)
 
@@ -253,53 +255,51 @@ def run_migration(pg_cfg: dict, sql_cfg: dict, tables: list, emit) -> dict:
             tgt_table = source_to_target(src_table)
             emit(f"\n{'─'*50}", "info")
             emit(f"[{idx}/{total}]  {PG_SCHEMA}.{src_table}", "info")
-            emit(f"       →  [dbo].[{tgt_table}]", "info")
+            emit(f"         →  [dbo].[{tgt_table}]", "info")
             emit(f"{'─'*50}", "info")
 
             try:
-                # Step A — Supabase columns (source of truth)
+                # A — Supabase columns
                 pg_cols = get_pg_columns(pg_conn, src_table)
                 if not pg_cols:
-                    emit(f"WARN  No eligible columns in Supabase. Skipping.", "warn")
+                    emit("WARN  No eligible columns in Supabase. Skipping.", "warn")
                     failed += 1
                     continue
                 emit(f"INFO  Supabase columns ({len(pg_cols)}): {pg_cols}", "info")
 
-                # Step B — Ensure target table exists in SQL Server
+                # B — Ensure target table
                 ensure_table_exists(sql_conn, pg_conn, src_table, tgt_table, pg_cols, emit)
 
-                # Step C — Intersect: only insert columns that exist on BOTH sides
+                # C — Intersect columns
                 sql_col_set = get_sql_columns(sql_conn, tgt_table)
                 columns     = [c for c in pg_cols if c.lower() in sql_col_set]
                 skipped     = set(pg_cols) - set(columns)
                 if skipped:
-                    emit(f"WARN  Skipped (missing in SQL Server): {sorted(skipped)}", "warn")
+                    emit(f"WARN  Skipped (not in SQL Server): {sorted(skipped)}", "warn")
                 emit(f"INFO  Inserting {len(columns)} column(s): {columns}", "info")
 
                 if not columns:
-                    emit(f"WARN  No matching columns. Skipping.", "warn")
+                    emit("WARN  No matching columns. Skipping.", "warn")
                     failed += 1
                     continue
 
-                # Step D — Fetch rows from Supabase
+                # D — Fetch rows
                 col_sel = ", ".join(f'"{c}"' for c in columns)
                 with pg_conn.cursor() as cur:
                     cur.execute(f'SELECT {col_sel} FROM "{PG_SCHEMA}"."{src_table}";')
                     rows = cur.fetchall()
                 emit(f"INFO  Fetched {len(rows)} row(s) from Supabase.", "info")
 
-                # Step E — Identity columns
+                # E — TRUNCATE
                 identity_cols = get_identity_columns(sql_conn, tgt_table)
                 if identity_cols:
                     emit(f"INFO  IDENTITY columns: {identity_cols}", "info")
-
-                # Step F — TRUNCATE (clean reload)
                 emit(f"INFO  Truncating [dbo].[{tgt_table}]...", "info")
                 sql_conn.cursor().execute(f"TRUNCATE TABLE [dbo].[{tgt_table}];")
                 sql_conn.commit()
-                emit(f"OK    Table truncated.", "ok")
+                emit("OK    Table truncated.", "ok")
 
-                # Step G — IDENTITY_INSERT ON → INSERT → OFF
+                # F — INSERT
                 has_identity = bool(identity_cols & {c.lower() for c in columns})
                 cur = sql_conn.cursor()
                 if has_identity:
@@ -330,7 +330,7 @@ def run_migration(pg_cfg: dict, sql_cfg: dict, tables: list, emit) -> dict:
                         sql_conn.commit()
 
                 if errors == 0:
-                    emit(f"OK    [{tgt_table}] — {total_rows}/{total_rows} rows inserted. Errors: 0", "ok")
+                    emit(f"OK    [{tgt_table}] — {total_rows}/{total_rows} rows. Errors: 0", "ok")
                 else:
                     emit(f"WARN  [{tgt_table}] — {total_rows - errors}/{total_rows} rows. Errors: {errors}", "warn")
                 success += 1
@@ -347,14 +347,14 @@ def run_migration(pg_cfg: dict, sql_cfg: dict, tables: list, emit) -> dict:
         sql_conn.close()
 
     emit(f"\n{'='*50}", "info")
-    emit(f"OK    Migration complete.", "ok")
+    emit("OK    Migration complete.", "ok")
     emit(f"INFO  Total: {total}  |  Success: {success}  |  Failed: {failed}", "info")
     emit(f"{'='*50}", "info")
     return {"total": total, "success": success, "failed": failed}
 
 
 # ─────────────────────────────────────────────
-# CSS (scoped — safe to call inside any page)
+# CSS
 # ─────────────────────────────────────────────
 def _inject_css():
     st.markdown("""
@@ -368,7 +368,6 @@ def _inject_css():
         letter-spacing: .1em; text-transform: uppercase; margin: 0 0 14px 0;
     }
     .mig-badge-ok   { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:600; background:#1a3a2a; color:#68d391; border:1px solid #276749; }
-    .mig-badge-fail { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:600; background:#3a1a1a; color:#fc8181; border:1px solid #742a2a; }
     .mig-badge-idle { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:600; background:#1a1f2e; color:#718096; border:1px solid #2d3748; }
     .mig-terminal {
         background:#0a0d14; border:1px solid #2d3748; border-radius:10px;
@@ -394,26 +393,26 @@ def _render_log(lines: list):
         text, kind = line
         cls = {"ok": "mig-line-ok", "warn": "mig-line-warn",
                "err": "mig-line-err"}.get(kind, "mig-line-info")
-        escaped = text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        escaped = (text.replace("&", "&amp;")
+                       .replace("<", "&lt;")
+                       .replace(">", "&gt;"))
         html += f'<div class="{cls}">{escaped}</div>'
     st.markdown(f'<div class="mig-terminal">{html}</div>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# Session state init (namespaced to avoid
-# collisions with your existing app's state)
+# Session state (namespaced with mig_)
 # ─────────────────────────────────────────────
 def _init_state():
     defaults = {
-        "mig_pg_ok":      False,
-        "mig_sql_ok":     False,
-        "mig_pg_cfg":     {},
-        "mig_sql_cfg":    {},
-        "mig_tables":     [],
-        "mig_log":        [],
-        "mig_running":    False,
-        "mig_done":       False,
-        "mig_metrics":    {},
+        "mig_pg_ok":   False,
+        "mig_sql_ok":  False,
+        "mig_sql_cfg": {},
+        "mig_tables":  [],
+        "mig_log":     [],
+        "mig_running": False,
+        "mig_done":    False,
+        "mig_metrics": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -421,50 +420,37 @@ def _init_state():
 
 
 # ─────────────────────────────────────────────
-# Main render function — call this from your app
+# Main render — call this from your app
 # ─────────────────────────────────────────────
 def render():
     _inject_css()
     _init_state()
 
-    # ── Page header ───────────────────────────
     st.markdown("## 🔄 Supabase → SQL Server Migration")
     st.markdown(
-        f"Migrates tables matching `{TABLE_PATTERN}` from "
-        f"`{PG_SCHEMA}` → SQL Server `dbo` schema. "
+        f"Migrates all tables matching `{TABLE_PATTERN}` from "
+        f"`{PG_SCHEMA}` into SQL Server `dbo` schema. "
         f"Column `system_id` is always excluded."
     )
     st.markdown("---")
 
-    # ── Two-column layout: Supabase | SQL Server ──
     col_left, col_right = st.columns(2, gap="large")
 
-    # ────────────────────────────
-    # LEFT — Supabase config
-    # ────────────────────────────
+    # ────────────────────────────────────────
+    # LEFT — Supabase status (no credentials shown)
+    # ────────────────────────────────────────
     with col_left:
         st.markdown('<div class="mig-card"><h4>🐘 Supabase Connection</h4>', unsafe_allow_html=True)
-
-        pg_host = st.text_input("Host",     value="aws-0-ap-south-1.pooler.supabase.com", key="mig_pg_host")
-        pg_port = st.text_input("Port",     value="6543",     key="mig_pg_port")
-        pg_db   = st.text_input("Database", value="postgres", key="mig_pg_db")
-        pg_user = st.text_input("Username", value="",         key="mig_pg_user")
-        pg_pass = st.text_input("Password", value="", type="password", key="mig_pg_pass")
-
-        pg_cfg = {
-            "host": pg_host, "port": pg_port,
-            "dbname": pg_db, "user": pg_user, "password": pg_pass,
-        }
+        st.caption("Supabase credentials are managed by the backend.")
 
         btn_col, badge_col = st.columns([1, 1])
         with btn_col:
             if st.button("Verify Connection", key="mig_btn_pg", use_container_width=True):
                 with st.spinner("Connecting to Supabase..."):
-                    ok, result = verify_pg(pg_cfg)
+                    ok, result = verify_pg()
                     if ok:
-                        st.session_state.mig_pg_ok  = True
-                        st.session_state.mig_pg_cfg  = pg_cfg
-                        st.session_state.mig_tables  = []  # reset until both verified
+                        st.session_state.mig_pg_ok = True
+                        st.session_state.mig_tables = []
                         st.success(f"Connected! Found {result} matching table(s).")
                     else:
                         st.session_state.mig_pg_ok = False
@@ -477,32 +463,24 @@ def render():
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ────────────────────────────
-    # RIGHT — SQL Server config
-    # ────────────────────────────
+    # ────────────────────────────────────────
+    # RIGHT — SQL Server DSN config (client fills this)
+    # ────────────────────────────────────────
     with col_right:
         st.markdown('<div class="mig-card"><h4>🗄️ SQL Server Connection</h4>', unsafe_allow_html=True)
 
-        sql_server = st.text_input(
-            "Server",
+        sql_dsn = st.text_input(
+            "DSN Name",
             value="",
-            placeholder="e.g. DESKTOP-ABC, 192.168.1.10, myserver\\SQLEXPRESS",
-            key="mig_sql_server",
-            help="Server name or IP address of the SQL Server instance"
+            placeholder="e.g. ODBC_WS_MIGRATION",
+            key="mig_sql_dsn",
+            help="Must match a DSN configured in Windows ODBC Data Source Administrator (64-bit)"
         )
         sql_db = st.text_input(
             "Database",
-            value="WS_MIGRATION",
+            value="",
+            placeholder="e.g. WS_MIGRATION",
             key="mig_sql_db"
-        )
-        sql_driver = st.selectbox(
-            "ODBC Driver",
-            ["ODBC Driver 17 for SQL Server",
-             "ODBC Driver 18 for SQL Server",
-             "ODBC Driver 13 for SQL Server",
-             "SQL Server"],
-            key="mig_sql_driver",
-            help="Must be installed on the machine running this app"
         )
         sql_auth = st.selectbox(
             "Authentication",
@@ -511,25 +489,42 @@ def render():
         )
 
         sql_uid = sql_pwd = ""
+        sql_trusted = "no"
+
         if sql_auth == "SQL Server Authentication":
             sql_uid = st.text_input("Username", value="", key="mig_sql_uid")
             sql_pwd = st.text_input("Password", value="", type="password", key="mig_sql_pwd")
+            sql_trusted = "no"
+        else:
+            sql_trusted = "yes"
+            st.info("Windows Authentication will use the current Windows session.")
 
-        # Live connection string preview
         sql_cfg = {
-            "server": sql_server, "database": sql_db,
-            "driver": sql_driver, "auth": sql_auth,
-            "uid": sql_uid, "pwd": sql_pwd,
+            "dsn":      sql_dsn,
+            "database": sql_db,
+            "uid":      sql_uid,
+            "pwd":      sql_pwd,
+            "trusted":  sql_trusted,
         }
-        if sql_server and sql_db:
-            preview = build_sql_connstr({**sql_cfg, "pwd": "***"})
-            st.caption(f"🔗 Connection string: `{preview}`")
+
+        # Live DSN connection string preview
+        if sql_dsn and sql_db:
+            preview = (
+                f"DSN={sql_dsn};"
+                f"UID={sql_uid or ''};"
+                f"PWD=***;"
+                f"Trusted_Connection={sql_trusted};"
+                f"DATABASE={sql_db};"
+            )
+            st.caption(f"🔗 `{preview}`")
 
         btn_col2, badge_col2 = st.columns([1, 1])
         with btn_col2:
             if st.button("Verify Connection", key="mig_btn_sql", use_container_width=True):
-                if not sql_server:
-                    st.warning("Please enter a server name.")
+                if not sql_dsn:
+                    st.warning("Please enter a DSN name.")
+                elif not sql_db:
+                    st.warning("Please enter a database name.")
                 else:
                     with st.spinner("Connecting to SQL Server..."):
                         ok, err = verify_sql(sql_cfg)
@@ -552,7 +547,7 @@ def render():
     if st.session_state.mig_pg_ok and st.session_state.mig_sql_ok:
         if not st.session_state.mig_tables:
             try:
-                pg_conn = psycopg2.connect(**build_pg_connstr(st.session_state.mig_pg_cfg))
+                pg_conn = _get_pg_conn()
                 st.session_state.mig_tables = get_pg_tables(pg_conn)
                 pg_conn.close()
             except Exception as e:
@@ -600,11 +595,8 @@ def render():
             st.session_state.mig_done    = False
             st.session_state.mig_log     = []
 
-            log_box = st.empty()
-
             def emit(msg: str, kind: str = "info"):
                 st.session_state.mig_log.append((msg, kind))
-                _render_log(st.session_state.mig_log)
 
             emit(f"{'='*50}", "info")
             emit(f"Migration started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "info")
@@ -615,7 +607,6 @@ def render():
 
             try:
                 result = run_migration(
-                    st.session_state.mig_pg_cfg,
                     st.session_state.mig_sql_cfg,
                     tables,
                     emit
@@ -654,7 +645,7 @@ def render():
             st.warning(f"⚠️ {m['failed']} table(s) failed. Check the log above.")
 
 
-# ── Allow running standalone for testing ──────
+# ── Standalone testing ─────────────────────────
 if __name__ == "__main__":
     st.set_page_config(page_title="Migration", page_icon="🔄", layout="wide")
     render()
