@@ -3,6 +3,15 @@ import psycopg2
 import pymssql
 from datetime import datetime
 
+import requests
+import streamlit as st
+
+try:
+    ip = requests.get("https://api.ipify.org").text
+    st.success(f"Streamlit Public IP: {ip}")
+except Exception as e:
+    st.error(str(e))
+
 # ─────────────────────────────────────────────
 # Migration constants
 # ─────────────────────────────────────────────
