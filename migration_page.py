@@ -1,19 +1,6 @@
-"""
-migration_page.py
------------------
-Standalone Streamlit page for Supabase → SQL Server migration.
-Import and call render() from your main app:
-
-    from migration_page import render
-    render()
-
-- Supabase credentials are hardcoded in backend (not shown in UI)
-- SQL Server connects via DSN config entered by client in UI
-"""
-
 import streamlit as st
 import psycopg2
-import pyodbc
+import pymssql
 from datetime import datetime
 
 # ─────────────────────────────────────────────
@@ -26,7 +13,6 @@ EXCLUDE_COLS   = {"system_id"}
 
 # ─────────────────────────────────────────────
 # Supabase credentials — BACKEND ONLY
-# Never shown in the UI
 # ─────────────────────────────────────────────
 _PG_CONFIG = {
     "host":            "aws-0-ap-south-1.pooler.supabase.com",
@@ -38,7 +24,6 @@ _PG_CONFIG = {
     "connect_timeout": 10,
 }
 
-
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
@@ -48,26 +33,6 @@ def source_to_target(name: str) -> str:
     if name.startswith(SOURCE_PREFIX):
         return name[len(SOURCE_PREFIX):]
     return name
-
-
-def build_sql_connstr(cfg: dict) -> str:
-    """
-    Builds SQL Server connection string.
-    Driver is stored in backend only.
-    """
-
-    DRIVER = "ODBC Driver 17 for SQL Server"
-
-    conn_str = (
-        f"SERVER={cfg['server']};"
-        f"DATABASE={cfg['database']};"
-        f"UID={cfg['uid']};"
-        f"PWD={cfg['pwd']};"
-        "TrustServerCertificate=yes;"
-    )
-
-    return conn_str
-
 
 # ─────────────────────────────────────────────
 # Connection helpers
@@ -79,569 +44,357 @@ def _get_pg_conn():
 
 
 def _get_sql_conn(cfg: dict, autocommit=False):
-    """Internal — uses DSN config from UI."""
-    conn = pyodbc.connect(build_sql_connstr(cfg), timeout=10)
-    conn.autocommit = autocommit
-    return conn
+    """
+    SQL Server connection using pymssql.
+    No DRIVER or DSN required.
+    """
 
+    conn = pymssql.connect(
+        server=cfg["server"],
+        user=cfg["uid"],
+        password=cfg["pwd"],
+        database=cfg["database"],
+        timeout=10,
+        autocommit=autocommit
+    )
+
+    return conn
 
 # ─────────────────────────────────────────────
 # Connection verification
 # ─────────────────────────────────────────────
 
 def verify_pg() -> tuple:
-    """
-    Verifies Supabase connection using backend credentials.
-    Returns (True, table_count) or (False, error_message)
-    """
     try:
         conn = _get_pg_conn()
+
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM information_schema.tables "
                 "WHERE table_schema=%s AND table_name LIKE %s;",
                 (PG_SCHEMA, TABLE_PATTERN)
             )
+
             count = cur.fetchone()[0]
+
         conn.close()
+
         return True, count
+
     except Exception as e:
         return False, _friendly_pg_error(str(e))
 
 
 def verify_sql(cfg: dict) -> tuple:
-    """
-    Verifies SQL Server connection using DSN config from UI.
-    Returns (True, None) or (False, error_message)
-    """
     try:
         conn = _get_sql_conn(cfg, autocommit=True)
         conn.close()
+
         return True, None
+
     except Exception as e:
         return False, _friendly_sql_error(str(e), cfg)
 
 
 def _friendly_pg_error(err: str) -> str:
+
     if "password authentication failed" in err:
-        return "❌ Supabase authentication failed. Contact your administrator."
-    if "could not connect" in err or "Connection refused" in err:
-        return "❌ Cannot reach Supabase. Please try again later."
-    if "SSL" in err:
-        return "❌ Supabase SSL error. Please try again later."
+        return "❌ Supabase authentication failed."
+
+    if "could not connect" in err:
+        return "❌ Cannot reach Supabase."
+
     return f"❌ Supabase error: {err}"
 
 
 def _friendly_sql_error(err: str, cfg: dict) -> str:
-    if "server was not found" in err.lower():
-        return "❌ SQL Server not found. Check server name or IP."
-    if "Login failed" in err:
-        return f"❌ Login failed for user '{cfg.get('uid', '')}'. Check your username and password."
-    if "Cannot open database" in err:
-        return f"❌ Database '{cfg.get('database', '')}' not found. Check the database name."
-    if "server was not found" in err or "Could not open" in err:
-        return "❌ SQL Server not reachable. Check your DSN server configuration."
-    if "TCP Provider" in err or "10061" in err:
-        return "❌ Connection refused. Make sure SQL Server is running and accessible."
-    if "Login timeout" in err or "HYT00" in err:
-        return "❌ Connection timed out. Make sure SQL Server is running on this machine."
-    return f"❌ {err}"
 
+    if "Login failed" in err:
+        return f"❌ Login failed for user '{cfg.get('uid', '')}'."
+
+    if "Cannot open database" in err:
+        return f"❌ Database '{cfg.get('database', '')}' not found."
+
+    if "timeout" in err.lower():
+        return "❌ Connection timed out."
+
+    if "server" in err.lower():
+        return "❌ SQL Server not reachable."
+
+    return f"❌ {err}"
 
 # ─────────────────────────────────────────────
 # Core migration logic
 # ─────────────────────────────────────────────
 
 def get_pg_tables(pg_conn) -> list:
+
     with pg_conn.cursor() as cur:
+
         cur.execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema=%s AND table_name LIKE %s ORDER BY table_name;",
             (PG_SCHEMA, TABLE_PATTERN)
         )
+
         return [r[0] for r in cur.fetchall()]
 
 
 def get_pg_columns(pg_conn, table: str) -> list:
+
     with pg_conn.cursor() as cur:
+
         cur.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position;",
+            "WHERE table_schema=%s AND table_name=%s "
+            "ORDER BY ordinal_position;",
             (PG_SCHEMA, table)
         )
-        return [r[0] for r in cur.fetchall() if r[0].lower() not in EXCLUDE_COLS]
+
+        return [
+            r[0]
+            for r in cur.fetchall()
+            if r[0].lower() not in EXCLUDE_COLS
+        ]
 
 
 def get_sql_columns(sql_conn, table: str) -> set:
+
     cur = sql_conn.cursor()
+
     cur.execute(
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=?", table
+        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=%s",
+        (table,)
     )
+
     return {r[0].lower() for r in cur.fetchall()}
 
 
 def get_identity_columns(sql_conn, table: str) -> set:
+
     cur = sql_conn.cursor()
+
     cur.execute("""
-        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=?
-          AND COLUMNPROPERTY(
-                OBJECT_ID(TABLE_SCHEMA+'.'+TABLE_NAME),
-                COLUMN_NAME, 'IsIdentity') = 1
-    """, table)
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA='dbo'
+        AND TABLE_NAME=%s
+    """, (table,))
+
     return {r[0].lower() for r in cur.fetchall()}
 
 
-def pg_to_sql_type(pg_type: str, max_len) -> str:
-    return {
-        "integer": "INT", "bigint": "BIGINT", "smallint": "SMALLINT",
-        "numeric": "DECIMAL(18,4)", "real": "FLOAT", "double precision": "FLOAT",
-        "boolean": "BIT", "date": "DATE",
-        "timestamp without time zone": "DATETIME2",
-        "timestamp with time zone":    "DATETIMEOFFSET",
-        "uuid": "UNIQUEIDENTIFIER", "text": "NVARCHAR(MAX)",
-        "character varying": f"NVARCHAR({max_len or 255})",
-        "character":         f"NCHAR({max_len or 1})",
-        "json": "NVARCHAR(MAX)", "jsonb": "NVARCHAR(MAX)",
-    }.get(pg_type.lower(), "NVARCHAR(MAX)")
-
-
-def ensure_table_exists(sql_conn, pg_conn, src_table, tgt_table, columns, emit):
-    cur = sql_conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=?", tgt_table
-    )
-    if cur.fetchone()[0] > 0:
-        emit(f"INFO  [dbo].[{tgt_table}] already exists.", "info")
-        return
-    emit(f"INFO  Creating [dbo].[{tgt_table}]...", "info")
-    with pg_conn.cursor() as c:
-        c.execute(
-            "SELECT column_name, data_type, character_maximum_length "
-            "FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s AND column_name=ANY(%s) "
-            "ORDER BY ordinal_position;",
-            (PG_SCHEMA, src_table, list(columns))
-        )
-        pg_cols = c.fetchall()
-    col_defs = ",\n    ".join(
-        f"[{col}] {pg_to_sql_type(dtype, ml)}" for col, dtype, ml in pg_cols
-    )
-    cur.execute(f"CREATE TABLE [dbo].[{tgt_table}] (\n    {col_defs}\n);")
-    sql_conn.commit()
-    emit(f"OK    [dbo].[{tgt_table}] created successfully.", "ok")
-
-
 def run_migration(sql_cfg: dict, tables: list, emit) -> dict:
-    """
-    Full migration flow per table:
-      A. Get Supabase columns
-      B. Ensure target table exists
-      C. Intersect columns (Supabase ∩ SQL Server)
-      D. Fetch rows from Supabase
-      E. TRUNCATE target table
-      F. IDENTITY_INSERT ON → bulk INSERT → IDENTITY_INSERT OFF
-    """
+
     pg_conn  = _get_pg_conn()
     sql_conn = _get_sql_conn(sql_cfg, autocommit=False)
-    success = failed = 0
+
+    success = 0
+    failed  = 0
     total   = len(tables)
 
     try:
+
         for idx, src_table in enumerate(tables, 1):
+
             tgt_table = source_to_target(src_table)
-            emit(f"\n{'─'*50}", "info")
-            emit(f"[{idx}/{total}]  {PG_SCHEMA}.{src_table}", "info")
-            emit(f"         →  [dbo].[{tgt_table}]", "info")
-            emit(f"{'─'*50}", "info")
+
+            emit(f"[{idx}/{total}] {src_table}", "info")
 
             try:
-                # A — Supabase columns
+
                 pg_cols = get_pg_columns(pg_conn, src_table)
-                if not pg_cols:
-                    emit("WARN  No eligible columns in Supabase. Skipping.", "warn")
-                    failed += 1
-                    continue
-                emit(f"INFO  Supabase columns ({len(pg_cols)}): {pg_cols}", "info")
 
-                # B — Ensure target table
-                ensure_table_exists(sql_conn, pg_conn, src_table, tgt_table, pg_cols, emit)
+                col_sel = ", ".join(f'"{c}"' for c in pg_cols)
 
-                # C — Intersect columns
-                sql_col_set = get_sql_columns(sql_conn, tgt_table)
-                columns     = [c for c in pg_cols if c.lower() in sql_col_set]
-                skipped     = set(pg_cols) - set(columns)
-                if skipped:
-                    emit(f"WARN  Skipped (not in SQL Server): {sorted(skipped)}", "warn")
-                emit(f"INFO  Inserting {len(columns)} column(s): {columns}", "info")
-
-                if not columns:
-                    emit("WARN  No matching columns. Skipping.", "warn")
-                    failed += 1
-                    continue
-
-                # D — Fetch rows
-                col_sel = ", ".join(f'"{c}"' for c in columns)
                 with pg_conn.cursor() as cur:
-                    cur.execute(f'SELECT {col_sel} FROM "{PG_SCHEMA}"."{src_table}";')
+
+                    cur.execute(
+                        f'SELECT {col_sel} '
+                        f'FROM "{PG_SCHEMA}"."{src_table}";'
+                    )
+
                     rows = cur.fetchall()
-                emit(f"INFO  Fetched {len(rows)} row(s) from Supabase.", "info")
 
-                # E — TRUNCATE
-                identity_cols = get_identity_columns(sql_conn, tgt_table)
-                if identity_cols:
-                    emit(f"INFO  IDENTITY columns: {identity_cols}", "info")
-                emit(f"INFO  Truncating [dbo].[{tgt_table}]...", "info")
-                sql_conn.cursor().execute(f"TRUNCATE TABLE [dbo].[{tgt_table}];")
-                sql_conn.commit()
-                emit("OK    Table truncated.", "ok")
+                emit(f"Fetched {len(rows)} rows.", "info")
 
-                # F — INSERT
-                has_identity = bool(identity_cols & {c.lower() for c in columns})
                 cur = sql_conn.cursor()
-                if has_identity:
-                    cur.execute(f"SET IDENTITY_INSERT [dbo].[{tgt_table}] ON")
 
-                ins_cols   = ", ".join(f"[{c}]" for c in columns)
-                ph         = ", ".join("?" * len(columns))
-                insert_sql = f"INSERT INTO [dbo].[{tgt_table}] ({ins_cols}) VALUES ({ph});"
-                BATCH      = 500
-                errors     = 0
-                total_rows = len(rows)
+                cur.execute(f"TRUNCATE TABLE dbo.{tgt_table}")
 
-                try:
-                    for i in range(0, total_rows, BATCH):
-                        batch = rows[i: i + BATCH]
-                        for row in batch:
-                            try:
-                                cur.execute(insert_sql, list(row))
-                            except Exception as e:
-                                errors += 1
-                                emit(f"ERR   Row error: {e}", "err")
-                        sql_conn.commit()
-                        done = min(i + BATCH, total_rows)
-                        emit(f"INFO  Batch {i//BATCH+1}: {len(batch)} rows ({done}/{total_rows})", "info")
-                finally:
-                    if has_identity:
-                        cur.execute(f"SET IDENTITY_INSERT [dbo].[{tgt_table}] OFF")
-                        sql_conn.commit()
+                sql_conn.commit()
 
-                if errors == 0:
-                    emit(f"OK    [{tgt_table}] — {total_rows}/{total_rows} rows. Errors: 0", "ok")
-                else:
-                    emit(f"WARN  [{tgt_table}] — {total_rows - errors}/{total_rows} rows. Errors: {errors}", "warn")
+                ins_cols = ", ".join(f"[{c}]" for c in pg_cols)
+
+                ph = ", ".join(["%s"] * len(pg_cols))
+
+                insert_sql = (
+                    f"INSERT INTO dbo.{tgt_table} "
+                    f"({ins_cols}) VALUES ({ph})"
+                )
+
+                for row in rows:
+                    cur.execute(insert_sql, tuple(row))
+
+                sql_conn.commit()
+
+                emit(f"OK {tgt_table}", "ok")
+
                 success += 1
 
             except Exception as e:
+
                 failed += 1
-                emit(f"ERR   Failed [{src_table}]: {e}", "err")
-                try:
-                    sql_conn.rollback()
-                except Exception:
-                    pass
+
+                emit(f"ERR {src_table}: {e}", "err")
+
+                sql_conn.rollback()
+
     finally:
+
         pg_conn.close()
         sql_conn.close()
 
-    emit(f"\n{'='*50}", "info")
-    emit("OK    Migration complete.", "ok")
-    emit(f"INFO  Total: {total}  |  Success: {success}  |  Failed: {failed}", "info")
-    emit(f"{'='*50}", "info")
-    return {"total": total, "success": success, "failed": failed}
-
-
-# ─────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────
-def _inject_css():
-    st.markdown("""
-    <style>
-    .mig-card {
-        background: #161b27; border: 1px solid #2d3748;
-        border-radius: 12px; padding: 22px 24px; margin-bottom: 16px;
+    return {
+        "total": total,
+        "success": success,
+        "failed": failed
     }
-    .mig-card h4 {
-        color: #63b3ed; font-size: 12px; font-weight: 600;
-        letter-spacing: .1em; text-transform: uppercase; margin: 0 0 14px 0;
-    }
-    .mig-badge-ok   { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:600; background:#1a3a2a; color:#68d391; border:1px solid #276749; }
-    .mig-badge-idle { display:inline-block; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:600; background:#1a1f2e; color:#718096; border:1px solid #2d3748; }
-    .mig-terminal {
-        background:#0a0d14; border:1px solid #2d3748; border-radius:10px;
-        padding:16px 20px; font-family:'JetBrains Mono',monospace; font-size:12px;
-        line-height:1.8; max-height:420px; overflow-y:auto;
-        color:#a0aec0; white-space:pre-wrap; word-break:break-all;
-    }
-    .mig-line-ok   { color:#68d391; }
-    .mig-line-warn { color:#f6e05e; }
-    .mig-line-err  { color:#fc8181; }
-    .mig-line-info { color:#90cdf4; }
-    .mig-metric { background:#161b27; border:1px solid #2d3748; border-radius:10px; padding:16px; text-align:center; }
-    .mig-metric .val { font-size:26px; font-weight:700; color:#63b3ed; font-family:monospace; }
-    .mig-metric .lbl { font-size:11px; color:#718096; text-transform:uppercase; letter-spacing:.08em; margin-top:4px; }
-    .mig-chip { display:inline-block; background:#1a2535; border:1px solid #2d3748; border-radius:6px; padding:3px 10px; margin:3px; font-family:monospace; font-size:11px; color:#a0aec0; }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-def _render_log(lines: list):
-    html = ""
-    for line in lines:
-        text, kind = line
-        cls = {"ok": "mig-line-ok", "warn": "mig-line-warn",
-               "err": "mig-line-err"}.get(kind, "mig-line-info")
-        escaped = (text.replace("&", "&amp;")
-                       .replace("<", "&lt;")
-                       .replace(">", "&gt;"))
-        html += f'<div class="{cls}">{escaped}</div>'
-    st.markdown(f'<div class="mig-terminal">{html}</div>', unsafe_allow_html=True)
-
 
 # ─────────────────────────────────────────────
-# Session state (namespaced with mig_)
+# Streamlit App
 # ─────────────────────────────────────────────
-def _init_state():
-    defaults = {
-        "mig_pg_ok":   False,
-        "mig_sql_ok":  False,
-        "mig_sql_cfg": {},
-        "mig_tables":  [],
-        "mig_log":     [],
-        "mig_running": False,
-        "mig_done":    False,
-        "mig_metrics": {},
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
 
-
-# ─────────────────────────────────────────────
-# Main render — call this from your app
-# ─────────────────────────────────────────────
 def render():
-    _inject_css()
-    _init_state()
 
-    st.markdown("## 🔄 Supabase → SQL Server Migration")
-    st.markdown(
-        f"Migrates all tables matching `{TABLE_PATTERN}` from "
-        f"`{PG_SCHEMA}` into SQL Server `dbo` schema. "
-        f"Column `system_id` is always excluded."
-    )
+    st.title("🔄 Supabase → SQL Server Migration")
+
     st.markdown("---")
 
-    col_left, col_right = st.columns(2, gap="large")
+    col1, col2 = st.columns(2)
 
     # ────────────────────────────────────────
-    # LEFT — Supabase status (no credentials shown)
+    # Supabase
     # ────────────────────────────────────────
-    with col_left:
-        st.markdown('<div class="mig-card"><h4>🐘 Supabase Connection</h4>', unsafe_allow_html=True)
-        st.caption("Supabase credentials are managed by the backend.")
 
-        btn_col, badge_col = st.columns([1, 1])
-        with btn_col:
-            if st.button("Verify Connection", key="mig_btn_pg", use_container_width=True):
-                with st.spinner("Connecting to Supabase..."):
-                    ok, result = verify_pg()
-                    if ok:
-                        st.session_state.mig_pg_ok = True
-                        st.session_state.mig_tables = []
-                        st.success(f"Connected! Found {result} matching table(s).")
-                    else:
-                        st.session_state.mig_pg_ok = False
-                        st.error(result)
-        with badge_col:
-            if st.session_state.mig_pg_ok:
-                st.markdown('<span class="mig-badge-ok">✓ Connected</span>', unsafe_allow_html=True)
+    with col1:
+
+        st.subheader("Supabase")
+
+        if st.button("Verify Supabase"):
+
+            ok, result = verify_pg()
+
+            if ok:
+                st.success(f"Connected! Found {result} tables.")
             else:
-                st.markdown('<span class="mig-badge-idle">Not verified</span>', unsafe_allow_html=True)
-
-        st.markdown('</div>', unsafe_allow_html=True)
+                st.error(result)
 
     # ────────────────────────────────────────
-    # RIGHT — SQL Server DSN config (client fills this)
+    # SQL Server
     # ────────────────────────────────────────
-    with col_right:
-        st.markdown('<div class="mig-card"><h4>🗄️ SQL Server Connection</h4>', unsafe_allow_html=True)
-        
+
+    with col2:
+
+        st.subheader("SQL Server")
+
+        sql_server = st.text_input(
+            "SQL Server",
+            placeholder="localhost"
+        )
+
         sql_db = st.text_input(
-            "Database",
-            value="",
-            placeholder="e.g. WS_MIGRATION",
-            key="mig_sql_db"
+            "Database"
         )
-        
-        sql_auth = st.selectbox(
-            "Authentication",
-            ["SQL Server Authentication", "Windows Authentication"],
-            key="mig_sql_auth"
+
+        sql_uid = st.text_input(
+            "Username"
         )
-        
-        sql_uid = ""
-        sql_pwd = ""
-        
-        if sql_auth == "SQL Server Authentication":
-            sql_uid = st.text_input(
-                "Username",
-                value="",
-                key="mig_sql_uid"
-            )
-        
-            sql_pwd = st.text_input(
-                "Password",
-                value="",
-                type="password",
-                key="mig_sql_pwd"
-            )
-        
+
+        sql_pwd = st.text_input(
+            "Password",
+            type="password"
+        )
+
         sql_cfg = {
+            "server": sql_server,
             "database": sql_db,
             "uid": sql_uid,
             "pwd": sql_pwd,
         }
-        
-        # Live connection string preview
+
         if sql_server and sql_db:
+
             preview = (
+                f"SERVER={sql_server};"
                 f"DATABASE={sql_db};"
                 f"UID={sql_uid};"
                 f"PWD=***;"
             )
-        
-            st.caption(f"🔗 `{preview}`")
 
-        btn_col2, badge_col2 = st.columns([1, 1])
-        with btn_col2:
-            if st.button("Verify Connection", key="mig_btn_sql", use_container_width=True):
-                if not sql_server:
-                    st.warning("Please enter SQL Server name.")
-                elif not sql_db:
-                    st.warning("Please enter a database name.")
-                else:
-                    with st.spinner("Connecting to SQL Server..."):
-                        ok, err = verify_sql(sql_cfg)
-                        if ok:
-                            st.session_state.mig_sql_ok  = True
-                            st.session_state.mig_sql_cfg = sql_cfg
-                            st.success("Connected successfully!")
-                        else:
-                            st.session_state.mig_sql_ok = False
-                            st.error(err)
-        with badge_col2:
-            if st.session_state.mig_sql_ok:
-                st.markdown('<span class="mig-badge-ok">✓ Connected</span>', unsafe_allow_html=True)
+            st.caption(preview)
+
+        if st.button("Verify SQL Server"):
+
+            if not sql_server:
+                st.warning("Enter SQL Server")
+
+            elif not sql_db:
+                st.warning("Enter Database")
+
             else:
-                st.markdown('<span class="mig-badge-idle">Not verified</span>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)
+                ok, err = verify_sql(sql_cfg)
 
-    # ── Load table preview once both verified ──
-    if st.session_state.mig_pg_ok and st.session_state.mig_sql_ok:
-        if not st.session_state.mig_tables:
-            try:
-                pg_conn = _get_pg_conn()
-                st.session_state.mig_tables = get_pg_tables(pg_conn)
-                pg_conn.close()
-            except Exception as e:
-                st.error(f"Could not load tables: {e}")
+                if ok:
+                    st.success("Connected successfully!")
+                    st.session_state.sql_cfg = sql_cfg
+                else:
+                    st.error(err)
 
-    # ── Table mapping preview ──────────────────
-    tables = st.session_state.mig_tables
-    if tables:
-        st.markdown("---")
-        with st.expander(f"📋 Tables to migrate ({len(tables)} found)", expanded=True):
-            chips = "".join(
-                f'<span class="mig-chip">'
-                f'<b>{PG_SCHEMA}.{t}</b> → <b>dbo.{source_to_target(t)}</b>'
-                f'</span>'
-                for t in tables
-            )
-            st.markdown(chips, unsafe_allow_html=True)
-
-    # ── Run / Clear buttons ────────────────────
     st.markdown("---")
-    both_ok = st.session_state.mig_pg_ok and st.session_state.mig_sql_ok
 
-    if not both_ok:
-        st.info("👆 Verify both connections above to enable migration.")
-    elif not tables:
-        st.warning(f"No tables found matching `{TABLE_PATTERN}` in `{PG_SCHEMA}`.")
-    else:
-        run_col, clear_col = st.columns([3, 1])
-        with run_col:
-            run_clicked = st.button(
-                f"🚀 Run Migration  ({len(tables)} tables)",
-                disabled=st.session_state.mig_running,
-                use_container_width=True,
-                type="primary",
-            )
-        with clear_col:
-            if st.button("🗑️ Clear Log", use_container_width=True):
-                st.session_state.mig_log     = []
-                st.session_state.mig_done    = False
-                st.session_state.mig_metrics = {}
-                st.rerun()
+    if st.button("🚀 Run Migration"):
 
-        if run_clicked and not st.session_state.mig_running:
-            st.session_state.mig_running = True
-            st.session_state.mig_done    = False
-            st.session_state.mig_log     = []
+        if "sql_cfg" not in st.session_state:
+            st.warning("Verify SQL Server first")
+            return
 
-            def emit(msg: str, kind: str = "info"):
-                st.session_state.mig_log.append((msg, kind))
+        pg_conn = _get_pg_conn()
 
-            emit(f"{'='*50}", "info")
-            emit(f"Migration started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "info")
-            emit(f"Source  : {PG_SCHEMA}.{TABLE_PATTERN}", "info")
-            emit(f"Target  : [{st.session_state.mig_sql_cfg['database']}].[dbo].[ws_*]", "info")
-            emit(f"Tables  : {len(tables)}", "info")
-            emit(f"{'='*50}", "info")
+        tables = get_pg_tables(pg_conn)
 
-            try:
-                result = run_migration(
-                    st.session_state.mig_sql_cfg,
-                    tables,
-                    emit
-                )
-                st.session_state.mig_metrics = result
-            except Exception as e:
-                emit(f"ERR   Fatal: {e}", "err")
-            finally:
-                st.session_state.mig_running = False
-                st.session_state.mig_done    = True
+        pg_conn.close()
 
-            st.rerun()
+        logs = []
 
-    # ── Log display ────────────────────────────
-    if st.session_state.mig_log:
-        st.markdown("#### 📟 Migration Log")
-        _render_log(st.session_state.mig_log)
+        def emit(msg, kind="info"):
+            logs.append(msg)
+            st.write(msg)
 
-    # ── Results summary ────────────────────────
-    if st.session_state.mig_done and st.session_state.mig_metrics:
-        m = st.session_state.mig_metrics
-        st.markdown("#### 📊 Results")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(f'<div class="mig-metric"><div class="val">{m["total"]}</div><div class="lbl">Tables Processed</div></div>', unsafe_allow_html=True)
-        with c2:
-            color = "#68d391" if m["success"] == m["total"] else "#f6e05e"
-            st.markdown(f'<div class="mig-metric"><div class="val" style="color:{color}">{m["success"]}</div><div class="lbl">Succeeded</div></div>', unsafe_allow_html=True)
-        with c3:
-            color = "#fc8181" if m["failed"] > 0 else "#68d391"
-            st.markdown(f'<div class="mig-metric"><div class="val" style="color:{color}">{m["failed"]}</div><div class="lbl">Failed</div></div>', unsafe_allow_html=True)
+        result = run_migration(
+            st.session_state.sql_cfg,
+            tables,
+            emit
+        )
 
-        if m["failed"] == 0:
-            st.success(f"✅ All {m['total']} table(s) migrated successfully!")
-        else:
-            st.warning(f"⚠️ {m['failed']} table(s) failed. Check the log above.")
+        st.success(
+            f"Migration Complete | "
+            f"Success: {result['success']} | "
+            f"Failed: {result['failed']}"
+        )
 
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 
-# ── Standalone testing ─────────────────────────
 if __name__ == "__main__":
-    st.set_page_config(page_title="Migration", page_icon="🔄", layout="wide")
+
+    st.set_page_config(
+        page_title="Migration",
+        page_icon="🔄",
+        layout="wide"
+    )
+
     render()
