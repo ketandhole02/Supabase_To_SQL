@@ -52,27 +52,46 @@ def build_pg_connstr(cfg: dict) -> dict:
     }
 
 
-def build_sql_connstr(cfg: dict) -> str:
-    """
-    Builds a pyodbc connection string purely from UI inputs.
-    No DSN needed — works on any machine including Streamlit Cloud.
+# def build_sql_connstr(cfg: dict) -> str:
+#     """
+#     Builds a pyodbc connection string purely from UI inputs.
+#     No DSN needed — works on any machine including Streamlit Cloud.
 
-    Supports:
-      - SQL Server Authentication  (UID + PWD)
-      - Windows Authentication     (Trusted_Connection=yes)
-    """
-    driver  = cfg.get("driver", "ODBC Driver 17 for SQL Server")
-    server  = cfg["server"].strip()
-    database = cfg["database"].strip()
+#     Supports:
+#       - SQL Server Authentication  (UID + PWD)
+#       - Windows Authentication     (Trusted_Connection=yes)
+#     """
+#     driver  = cfg.get("driver", "ODBC Driver 17 for SQL Server")
+#     server  = cfg["server"].strip()
+#     database = cfg["database"].strip()
 
-    base = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
+#     base = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
 
-    if cfg["auth"] == "Windows Authentication":
-        return base + "Trusted_Connection=yes;"
-    else:
-        uid = cfg["uid"].strip()
-        pwd = cfg["pwd"]
-        return base + f"UID={uid};PWD={pwd};"
+#     if cfg["auth"] == "Windows Authentication":
+#         return base + "Trusted_Connection=yes;"
+#     else:
+#         uid = cfg["uid"].strip()
+#         pwd = cfg["pwd"]
+#         return base + f"UID={uid};PWD={pwd};"
+
+
+
+
+def get_sql_connection():
+    log.info("Connecting to local SQL Server...")
+    cfg = DSN_CONFIG
+    conn_str = (
+        
+        f"DSN={cfg['DSN']};"
+        f"UID={cfg['Uid']};"
+        f"PWD={cfg['Password']};"
+        f"Trusted_Connection={cfg['Trusted_Connection']};"
+        f"DATABASE={cfg['Database']};"
+    )
+    
+    conn = pyodbc.connect(conn_str, autocommit=False)
+    log.info("✓ SQL Server connection established.")
+    return conn
 
 
 # ─────────────────────────────────────────────
@@ -99,7 +118,7 @@ def verify_pg(cfg: dict) -> tuple:
 def verify_sql(cfg: dict) -> tuple:
     """Returns (True, None) or (False, error_message)"""
     try:
-        conn = pyodbc.connect(build_sql_connstr(cfg), timeout=10)
+        conn = pyodbc.connect(get_sql_connection(cfg), timeout=10)
         conn.close()
         return True, None
     except Exception as e:
