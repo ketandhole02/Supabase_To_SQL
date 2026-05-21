@@ -1,98 +1,118 @@
 import streamlit as st
 import psycopg2
-import pymssql
+import pyodbc
 from datetime import datetime
-
 import requests
-import streamlit as st
-
-try:
-    ip = requests.get("https://api.ipify.org").text
-    st.success(f"Streamlit Public IP: {ip}")
-except Exception as e:
-    st.error(str(e))
-
-
-
 import socket
-import streamlit as st
-
-host = "aide-aws-sqlserver.cva2cqyqop46.eu-north-1.rds.amazonaws.com"
-port = 1433
-
-try:
-    socket.create_connection((host, port), timeout=10)
-    st.success("Port 1433 reachable")
-except Exception as e:
-    st.error(f"Connection failed: {e}")
 
 # ─────────────────────────────────────────────
-# Migration constants
+# DEBUG / NETWORK CHECKS
 # ─────────────────────────────────────────────
-PG_SCHEMA      = "aide_datamart"
-TABLE_PATTERN  = "migr_sql_to_ws_%"
-SOURCE_PREFIX  = "migr_sql_to_"
-EXCLUDE_COLS   = {"system_id"}
+
+# try:
+#     ip = requests.get("https://api.ipify.org").text
+#     st.success(f"🌍 Streamlit Public IP: {ip}")
+# except Exception as e:
+#     st.error(f"IP Error: {e}")
+
+# try:
+#     host = "aide-aws-sqlserver.cva2cqyqop46.eu-north-1.rds.amazonaws.com"
+#     port = 1433
+
+#     socket.create_connection((host, port), timeout=10)
+
+#     st.success("✅ Port 1433 reachable")
+
+# except Exception as e:
+#     st.error(f"❌ Connection failed: {e}")
 
 # ─────────────────────────────────────────────
-# Supabase credentials — BACKEND ONLY
+# MIGRATION CONSTANTS
 # ─────────────────────────────────────────────
+
+PG_SCHEMA = "aide_datamart"
+TABLE_PATTERN = "migr_sql_to_ws_%"
+SOURCE_PREFIX = "migr_sql_to_"
+EXCLUDE_COLS = {"system_id"}
+
+# ─────────────────────────────────────────────
+# SUPABASE CONFIG
+# ─────────────────────────────────────────────
+
 _PG_CONFIG = {
-    "host":            "aws-0-ap-south-1.pooler.supabase.com",
-    "port":            6543,
-    "dbname":          "postgres",
-    "user":            "postgres.smvcwjoefalywezaftrw",
-    "password":        "SupaBaseDE@2026",
-    "sslmode":         "require",
+    "host": "aws-0-ap-south-1.pooler.supabase.com",
+    "port": 6543,
+    "dbname": "postgres",
+    "user": "postgres.smvcwjoefalywezaftrw",
+    "password": "SupaBaseDE@2026",
+    "sslmode": "require",
     "connect_timeout": 10,
 }
 
 # ─────────────────────────────────────────────
-# Helpers
+# HELPERS
 # ─────────────────────────────────────────────
 
 def source_to_target(name: str) -> str:
-    """migr_sql_to_ws_obj_object → ws_obj_object"""
+    """
+    migr_sql_to_ws_table → ws_table
+    """
     if name.startswith(SOURCE_PREFIX):
         return name[len(SOURCE_PREFIX):]
+
     return name
 
 # ─────────────────────────────────────────────
-# Connection helpers
+# CONNECTION HELPERS
 # ─────────────────────────────────────────────
 
 def _get_pg_conn():
-    """Internal — uses hardcoded backend credentials."""
+    """
+    Supabase connection
+    """
     return psycopg2.connect(**_PG_CONFIG)
 
 
 def _get_sql_conn(cfg: dict, autocommit=False):
+    """
+    SQL Server connection using pyodbc
+    Driver is hardcoded in backend only
+    """
 
-    conn = pymssql.connect(
-        server=cfg["server"],
-        port=1433,
-        user=cfg["uid"],
-        password=cfg["pwd"],
-        database=cfg["database"],
-        login_timeout=30,
-        timeout=30,
-        autocommit=autocommit,
-        as_dict=False
+    conn_str = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={cfg['server']};"
+        f"DATABASE={cfg['database']};"
+        f"UID={cfg['uid']};"
+        f"PWD={cfg['pwd']};"
+        "TrustServerCertificate=yes;"
     )
 
+    conn = pyodbc.connect(conn_str, timeout=30)
+
+    conn.autocommit = autocommit
+
     return conn
+
 # ─────────────────────────────────────────────
-# Connection verification
+# CONNECTION VALIDATION
 # ─────────────────────────────────────────────
 
-def verify_pg() -> tuple:
+def verify_pg():
+
     try:
+
         conn = _get_pg_conn()
 
         with conn.cursor() as cur:
+
             cur.execute(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_schema=%s AND table_name LIKE %s;",
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema=%s
+                AND table_name LIKE %s
+                """,
                 (PG_SCHEMA, TABLE_PATTERN)
             )
 
@@ -103,72 +123,58 @@ def verify_pg() -> tuple:
         return True, count
 
     except Exception as e:
-        return False, _friendly_pg_error(str(e))
+
+        return False, str(e)
 
 
-def verify_sql(cfg: dict) -> tuple:
+def verify_sql(cfg: dict):
+
     try:
+
         conn = _get_sql_conn(cfg, autocommit=True)
+
         conn.close()
 
         return True, None
 
     except Exception as e:
-        return False, _friendly_sql_error(str(e), cfg)
 
-
-def _friendly_pg_error(err: str) -> str:
-
-    if "password authentication failed" in err:
-        return "❌ Supabase authentication failed."
-
-    if "could not connect" in err:
-        return "❌ Cannot reach Supabase."
-
-    return f"❌ Supabase error: {err}"
-
-
-def _friendly_sql_error(err: str, cfg: dict) -> str:
-
-    if "Login failed" in err:
-        return f"❌ Login failed for user '{cfg.get('uid', '')}'."
-
-    if "Cannot open database" in err:
-        return f"❌ Database '{cfg.get('database', '')}' not found."
-
-    if "timeout" in err.lower():
-        return "❌ Connection timed out."
-
-    if "server" in err.lower():
-        return "❌ SQL Server not reachable."
-
-    return f"❌ {err}"
+        return False, str(e)
 
 # ─────────────────────────────────────────────
-# Core migration logic
+# POSTGRES HELPERS
 # ─────────────────────────────────────────────
 
-def get_pg_tables(pg_conn) -> list:
+def get_pg_tables(pg_conn):
 
     with pg_conn.cursor() as cur:
 
         cur.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema=%s AND table_name LIKE %s ORDER BY table_name;",
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema=%s
+            AND table_name LIKE %s
+            ORDER BY table_name
+            """,
             (PG_SCHEMA, TABLE_PATTERN)
         )
 
         return [r[0] for r in cur.fetchall()]
 
 
-def get_pg_columns(pg_conn, table: str) -> list:
+def get_pg_columns(pg_conn, table):
 
     with pg_conn.cursor() as cur:
 
         cur.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s "
-            "ORDER BY ordinal_position;",
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema=%s
+            AND table_name=%s
+            ORDER BY ordinal_position
+            """,
             (PG_SCHEMA, table)
         )
 
@@ -178,42 +184,38 @@ def get_pg_columns(pg_conn, table: str) -> list:
             if r[0].lower() not in EXCLUDE_COLS
         ]
 
+# ─────────────────────────────────────────────
+# SQL SERVER HELPERS
+# ─────────────────────────────────────────────
 
-def get_sql_columns(sql_conn, table: str) -> set:
+def get_sql_columns(sql_conn, table):
 
     cur = sql_conn.cursor()
 
     cur.execute(
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=%s",
-        (table,)
+        """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA='dbo'
+        AND TABLE_NAME=?
+        """,
+        table
     )
 
     return {r[0].lower() for r in cur.fetchall()}
 
+# ─────────────────────────────────────────────
+# MIGRATION LOGIC
+# ─────────────────────────────────────────────
 
-def get_identity_columns(sql_conn, table: str) -> set:
+def run_migration(sql_cfg, tables, emit):
 
-    cur = sql_conn.cursor()
+    pg_conn = _get_pg_conn()
 
-    cur.execute("""
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA='dbo'
-        AND TABLE_NAME=%s
-    """, (table,))
-
-    return {r[0].lower() for r in cur.fetchall()}
-
-
-def run_migration(sql_cfg: dict, tables: list, emit) -> dict:
-
-    pg_conn  = _get_pg_conn()
     sql_conn = _get_sql_conn(sql_cfg, autocommit=False)
 
     success = 0
-    failed  = 0
-    total   = len(tables)
+    failed = 0
 
     try:
 
@@ -221,24 +223,38 @@ def run_migration(sql_cfg: dict, tables: list, emit) -> dict:
 
             tgt_table = source_to_target(src_table)
 
-            emit(f"[{idx}/{total}] {src_table}", "info")
+            emit(f"🚀 [{idx}/{len(tables)}] {src_table}")
 
             try:
 
                 pg_cols = get_pg_columns(pg_conn, src_table)
 
-                col_sel = ", ".join(f'"{c}"' for c in pg_cols)
+                sql_cols = get_sql_columns(sql_conn, tgt_table)
+
+                columns = [
+                    c for c in pg_cols
+                    if c.lower() in sql_cols
+                ]
+
+                if not columns:
+                    emit(f"⚠️ No matching columns for {tgt_table}")
+                    failed += 1
+                    continue
+
+                col_sel = ", ".join(f'"{c}"' for c in columns)
 
                 with pg_conn.cursor() as cur:
 
                     cur.execute(
-                        f'SELECT {col_sel} '
-                        f'FROM "{PG_SCHEMA}"."{src_table}";'
+                        f'''
+                        SELECT {col_sel}
+                        FROM "{PG_SCHEMA}"."{src_table}"
+                        '''
                     )
 
                     rows = cur.fetchall()
 
-                emit(f"Fetched {len(rows)} rows.", "info")
+                emit(f"📥 Rows fetched: {len(rows)}")
 
                 cur = sql_conn.cursor()
 
@@ -246,45 +262,48 @@ def run_migration(sql_cfg: dict, tables: list, emit) -> dict:
 
                 sql_conn.commit()
 
-                ins_cols = ", ".join(f"[{c}]" for c in pg_cols)
+                insert_cols = ", ".join(f"[{c}]" for c in columns)
 
-                ph = ", ".join(["%s"] * len(pg_cols))
+                placeholders = ", ".join("?" * len(columns))
 
-                insert_sql = (
-                    f"INSERT INTO dbo.{tgt_table} "
-                    f"({ins_cols}) VALUES ({ph})"
-                )
+                insert_sql = f"""
+                    INSERT INTO dbo.{tgt_table}
+                    ({insert_cols})
+                    VALUES ({placeholders})
+                """
 
-                for row in rows:
-                    cur.execute(insert_sql, tuple(row))
+                cur.fast_executemany = True
+
+                cur.executemany(insert_sql, rows)
 
                 sql_conn.commit()
 
-                emit(f"OK {tgt_table}", "ok")
+                emit(f"✅ Completed: {tgt_table}")
 
                 success += 1
 
             except Exception as e:
 
-                failed += 1
-
-                emit(f"ERR {src_table}: {e}", "err")
-
                 sql_conn.rollback()
+
+                emit(f"❌ Failed {src_table}: {e}")
+
+                failed += 1
 
     finally:
 
         pg_conn.close()
+
         sql_conn.close()
 
     return {
-        "total": total,
         "success": success,
-        "failed": failed
+        "failed": failed,
+        "total": len(tables)
     }
 
 # ─────────────────────────────────────────────
-# Streamlit App
+# STREAMLIT UI
 # ─────────────────────────────────────────────
 
 def render():
@@ -296,33 +315,33 @@ def render():
     col1, col2 = st.columns(2)
 
     # ────────────────────────────────────────
-    # Supabase
+    # SUPABASE
     # ────────────────────────────────────────
 
     with col1:
 
-        st.subheader("Supabase")
+        st.subheader("🐘 Supabase")
 
         if st.button("Verify Supabase"):
 
             ok, result = verify_pg()
 
             if ok:
-                st.success(f"Connected! Found {result} tables.")
+                st.success(f"Connected! Tables Found: {result}")
             else:
                 st.error(result)
 
     # ────────────────────────────────────────
-    # SQL Server
+    # SQL SERVER
     # ────────────────────────────────────────
 
     with col2:
 
-        st.subheader("SQL Server")
+        st.subheader("🗄️ SQL Server")
 
         sql_server = st.text_input(
             "SQL Server",
-            placeholder="e.g. hostname only"
+            placeholder="hostname only"
         )
 
         sql_db = st.text_input(
@@ -345,17 +364,6 @@ def render():
             "pwd": sql_pwd,
         }
 
-        if sql_server and sql_db:
-
-            preview = (
-                f"SERVER={sql_server};"
-                f"DATABASE={sql_db};"
-                f"UID={sql_uid};"
-                f"PWD=***;"
-            )
-
-            st.caption(preview)
-
         if st.button("Verify SQL Server"):
 
             if not sql_server:
@@ -369,17 +377,27 @@ def render():
                 ok, err = verify_sql(sql_cfg)
 
                 if ok:
-                    st.success("Connected successfully!")
+
+                    st.success("✅ SQL Server Connected")
+
                     st.session_state.sql_cfg = sql_cfg
+
                 else:
+
                     st.error(err)
 
     st.markdown("---")
 
+    # ────────────────────────────────────────
+    # RUN MIGRATION
+    # ────────────────────────────────────────
+
     if st.button("🚀 Run Migration"):
 
         if "sql_cfg" not in st.session_state:
+
             st.warning("Verify SQL Server first")
+
             return
 
         pg_conn = _get_pg_conn()
@@ -388,11 +406,17 @@ def render():
 
         pg_conn.close()
 
-        logs = []
+        st.info(f"Tables Found: {len(tables)}")
 
-        def emit(msg, kind="info"):
-            logs.append(msg)
-            st.write(msg)
+        logs = st.empty()
+
+        log_lines = []
+
+        def emit(msg):
+
+            log_lines.append(msg)
+
+            logs.code("\n".join(log_lines))
 
         result = run_migration(
             st.session_state.sql_cfg,
@@ -401,13 +425,17 @@ def render():
         )
 
         st.success(
-            f"Migration Complete | "
-            f"Success: {result['success']} | "
-            f"Failed: {result['failed']}"
+            f"""
+            Migration Completed
+
+            Total   : {result['total']}
+            Success : {result['success']}
+            Failed  : {result['failed']}
+            """
         )
 
 # ─────────────────────────────────────────────
-# Main
+# MAIN
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
