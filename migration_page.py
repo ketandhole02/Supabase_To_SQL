@@ -12,6 +12,20 @@ try:
 except Exception as e:
     st.error(str(e))
 
+
+
+import socket
+import streamlit as st
+
+host = "aide-aws-sqlserver.cva2cqyqop46.eu-north-1.rds.amazonaws.com"
+port = 1433
+
+try:
+    socket.create_connection((host, port), timeout=10)
+    st.success("Port 1433 reachable")
+except Exception as e:
+    st.error(f"Connection failed: {e}")
+
 # ─────────────────────────────────────────────
 # Migration constants
 # ─────────────────────────────────────────────
