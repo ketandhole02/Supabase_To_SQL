@@ -44,22 +44,18 @@ def _get_pg_conn():
 
 
 def _get_sql_conn(cfg: dict, autocommit=False):
-    """
-    SQL Server connection using pymssql.
-    No DRIVER or DSN required.
-    """
 
     conn = pymssql.connect(
         server=cfg["server"],
+        port=1433,
         user=cfg["uid"],
         password=cfg["pwd"],
         database=cfg["database"],
-        timeout=10,
+        timeout=30,
         autocommit=autocommit
     )
 
     return conn
-
 # ─────────────────────────────────────────────
 # Connection verification
 # ─────────────────────────────────────────────
@@ -301,7 +297,7 @@ def render():
 
         sql_server = st.text_input(
             "SQL Server",
-            placeholder="localhost"
+            placeholder="e.g. hostname only"
         )
 
         sql_db = st.text_input(
