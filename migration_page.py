@@ -52,16 +52,20 @@ def source_to_target(name: str) -> str:
 
 def build_sql_connstr(cfg: dict) -> str:
     """
-    Builds pyodbc connection string from DSN config entered by client.
-    Supports Windows Authentication and SQL Server Authentication.
+    Builds SQL Server connection string.
+    Driver is stored in backend only.
     """
+
+    DRIVER = "ODBC Driver 17 for SQL Server"
+
     conn_str = (
-        f"DSN={cfg['dsn']};"
+        f"SERVER={cfg['server']};"
+        f"DATABASE={cfg['database']};"
         f"UID={cfg['uid']};"
         f"PWD={cfg['pwd']};"
-        f"Trusted_Connection={cfg['trusted']};"
-        f"DATABASE={cfg['database']};"
+        "TrustServerCertificate=yes;"
     )
+
     return conn_str
 
 
@@ -129,13 +133,8 @@ def _friendly_pg_error(err: str) -> str:
 
 
 def _friendly_sql_error(err: str, cfg: dict) -> str:
-    if "Data source name not found" in err or "IM002" in err:
-        return (
-            f"❌ DSN '{cfg.get('dsn', '')}' not found on this machine.\n\n"
-            "Open **Windows ODBC Data Source Administrator (64-bit)** "
-            "→ System DSN → Add → configure your SQL Server → "
-            f"name it exactly **{cfg.get('dsn', '')}**."
-        )
+    if "server was not found" in err.lower():
+        return "❌ SQL Server not found. Check server name or IP."
     if "Login failed" in err:
         return f"❌ Login failed for user '{cfg.get('uid', '')}'. Check your username and password."
     if "Cannot open database" in err:
@@ -468,61 +467,58 @@ def render():
     # ────────────────────────────────────────
     with col_right:
         st.markdown('<div class="mig-card"><h4>🗄️ SQL Server Connection</h4>', unsafe_allow_html=True)
-
-        sql_dsn = st.text_input(
-            "DSN Name",
-            value="",
-            placeholder="e.g. ODBC_WS_MIGRATION",
-            key="mig_sql_dsn",
-            help="Must match a DSN configured in Windows ODBC Data Source Administrator (64-bit)"
-        )
+        
         sql_db = st.text_input(
             "Database",
             value="",
             placeholder="e.g. WS_MIGRATION",
             key="mig_sql_db"
         )
+        
         sql_auth = st.selectbox(
             "Authentication",
             ["SQL Server Authentication", "Windows Authentication"],
             key="mig_sql_auth"
         )
-
-        sql_uid = sql_pwd = ""
-        sql_trusted = "no"
-
+        
+        sql_uid = ""
+        sql_pwd = ""
+        
         if sql_auth == "SQL Server Authentication":
-            sql_uid = st.text_input("Username", value="", key="mig_sql_uid")
-            sql_pwd = st.text_input("Password", value="", type="password", key="mig_sql_pwd")
-            sql_trusted = "no"
-        else:
-            sql_trusted = "yes"
-            st.info("Windows Authentication will use the current Windows session.")
-
-        sql_cfg = {
-            "dsn":      sql_dsn,
-            "database": sql_db,
-            "uid":      sql_uid,
-            "pwd":      sql_pwd,
-            "trusted":  sql_trusted,
-        }
-
-        # Live DSN connection string preview
-        if sql_dsn and sql_db:
-            preview = (
-                f"DSN={sql_dsn};"
-                f"UID={sql_uid or ''};"
-                f"PWD=***;"
-                f"Trusted_Connection={sql_trusted};"
-                f"DATABASE={sql_db};"
+            sql_uid = st.text_input(
+                "Username",
+                value="",
+                key="mig_sql_uid"
             )
+        
+            sql_pwd = st.text_input(
+                "Password",
+                value="",
+                type="password",
+                key="mig_sql_pwd"
+            )
+        
+        sql_cfg = {
+            "database": sql_db,
+            "uid": sql_uid,
+            "pwd": sql_pwd,
+        }
+        
+        # Live connection string preview
+        if sql_server and sql_db:
+            preview = (
+                f"DATABASE={sql_db};"
+                f"UID={sql_uid};"
+                f"PWD=***;"
+            )
+        
             st.caption(f"🔗 `{preview}`")
 
         btn_col2, badge_col2 = st.columns([1, 1])
         with btn_col2:
             if st.button("Verify Connection", key="mig_btn_sql", use_container_width=True):
-                if not sql_dsn:
-                    st.warning("Please enter a DSN name.")
+                if not sql_server:
+                    st.warning("Please enter SQL Server name.")
                 elif not sql_db:
                     st.warning("Please enter a database name.")
                 else:
