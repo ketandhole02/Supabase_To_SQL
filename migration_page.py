@@ -51,8 +51,10 @@ def _get_sql_conn(cfg: dict, autocommit=False):
         user=cfg["uid"],
         password=cfg["pwd"],
         database=cfg["database"],
+        login_timeout=30,
         timeout=30,
-        autocommit=autocommit
+        autocommit=autocommit,
+        as_dict=False
     )
 
     return conn
